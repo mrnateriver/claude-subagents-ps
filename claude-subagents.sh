@@ -12,6 +12,15 @@ frontmatter_field() {
 }
 
 list_agents() {
+# every live session's transcript — a workflow's completion notification can land in a
+# session that forked the one owning the run dir, so run-finished checks scan all of them
+all_parents=$(for sess in "$CLAUDE_DIR"/sessions/*.json; do
+  [ -e "$sess" ] || continue
+  kill -0 "$(jq -r .pid "$sess")" 2>/dev/null || continue
+  printf '%s/projects/%s/%s.jsonl\n' "$CLAUDE_DIR" \
+    "$(jq -r .cwd "$sess" | tr '/.' '--')" "$(jq -r .sessionId "$sess")"
+done)
+
 for sess in "$CLAUDE_DIR"/sessions/*.json; do
   [ -e "$sess" ] || continue
   pid=$(jq -r .pid "$sess")
@@ -30,17 +39,32 @@ for sess in "$CLAUDE_DIR"/sessions/*.json; do
     agent_type=$(jq -r '.agentType // "?"' "$meta")
     desc=$(jq -r '.description // ""' "$meta")
     if [ -n "$tool_use_id" ]; then
-      # a tool_result for the spawning tool_use means the subagent finished
-      if grep -q "\"tool_use_id\":\"$tool_use_id\"" "$parent" 2>/dev/null; then
-        continue
-      fi
+      result=$(grep "\"tool_use_id\":\"$tool_use_id\"" "$parent" 2>/dev/null || true)
+      case $result in
+        '') ;;   # no tool_result yet: still running
+        *'Async agent launched'*)
+          # background agent: that tool_result is only the launch stub, written at spawn;
+          # it's finished once its completion task-notification lands in the parent
+          # ponytail: an agent resumed after notifying still reads as finished
+          if grep -q "<task-id>$agent_id</task-id>" "$parent" 2>/dev/null; then
+            continue
+          fi ;;
+        *) continue ;;   # synchronous agent: tool_result = finished
+      esac
     else
       # workflow agent: no toolUseId; the run's journal logs a result event on finish
-      # ponytail: agents killed mid-run never get a result entry and show as running
       journal="$(dirname "$meta")/journal.jsonl"
       if jq -e --arg id "$agent_id" 'select(.type=="result" and .agentId==$id)' "$journal" >/dev/null 2>&1; then
         continue
       fi
+      # agents killed mid-run never get a result entry, but a finished run means they're
+      # done: the run's completion notification cites its journal path
+      run_journal="$(basename "$(dirname "$meta")")/journal.jsonl"
+      run_done=
+      while IFS= read -r pp; do
+        grep -qF "$run_journal" "$pp" 2>/dev/null && { run_done=1; break; }
+      done <<< "$all_parents"
+      if [ -n "$run_done" ]; then continue; fi
       [ -n "$desc" ] || desc=$(basename "$(dirname "$meta")")   # show workflow run id
     fi
 
